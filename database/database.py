@@ -7,38 +7,94 @@ from contextlib import contextmanager
 import logging
 
 class Database:
-    def __init__(self, db_name: str = 'crypto_data.db', pool_size: int = 5):
-        self.db_name = db_name
+    def __init__(self, db_path: str, pool_size: int = 5):
+        self.db_path = db_path
         self.pool_size = pool_size
-        self._logger = logging.getLogger(__name__)
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self._init_connection_pool()
-        self._initialize_version_table()
-        self._migrate()
+        self.connection_pool = []
+        self._initialize_pool()
+        self._initialize_tables()
+        self.logger = logging.getLogger(__name__)
     
-    def _init_connection_pool(self):
-        """Initialize SQLite connection pool"""
-        self.conn = sqlite3.connect(
-            self.db_name,
-            check_same_thread=False,
-            timeout=30
-        )
-        # Pooling simulation for SQLite
-        self.conn.execute("PRAGMA journal_mode=WAL")
-
+    def _initialize_pool(self) -> None:
+        """Initialize the connection pool."""
+        for _ in range(self.pool_size):
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            self.connection_pool.append(conn)
+    
     @contextmanager
-    def managed_cursor(self) -> sqlite3.Cursor:
-        """Context manager for connection handling"""
+    def get_connection(self):
+        """Get a connection from the pool with context management."""
+        if not self.connection_pool:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            yield conn
+            conn.close()
+        else:
+            conn = self.connection_pool.pop()
+            try:
+                yield conn
+            finally:
+                self.connection_pool.append(conn)
+
+    def _initialize_tables(self) -> None:
+        """Initialize database tables if they don't exist."""
         try:
-            cursor = self.conn.cursor()
-            yield cursor
-            self.conn.commit()
+            with self.transaction() as conn:
+                # Historical price data table
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS historical_data (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT,
+                        date TEXT,
+                        open REAL,
+                        high REAL,
+                        low REAL,
+                        close REAL,
+                        volume REAL,
+                        UNIQUE(symbol, date)
+                    )
+                ''')
+                
+                # Model versions table
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS model_versions (
+                        version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        model_type TEXT,
+                        model_blob BLOB,
+                        feature_names BLOB,
+                        metrics BLOB,
+                        model_params BLOB,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        accuracy REAL,
+                        precision_score REAL
+                    )
+                ''')
+                
+                # Migration version tracking
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS migrations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        version TEXT,
+                        applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                self.logger.info("Database tables initialized successfully")
         except Exception as e:
-            self.conn.rollback()
-            self._logger.error(f"Transaction failed: {str(e)}")
-            raise
-        finally:
-            cursor.close()
+            self.logger.error(f"Failed to initialize tables: {str(e)}")
+    
+    @contextmanager
+    def transaction(self):
+        """Context manager for transaction handling."""
+        with self.get_connection() as conn:
+            try:
+                yield conn
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                self.logger.error(f"Transaction error: {str(e)}")
+                raise
 
     def _initialize_version_table(self):
         """Create version tracking table if not exists"""
@@ -123,7 +179,7 @@ class Database:
                 volume REAL,
                 PRIMARY KEY (symbol, date)
             )
-        ''')  # Added closing parenthesis and fixed syntax
+        ''')
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS news_data (
@@ -436,26 +492,111 @@ class Database:
         except Exception as e:
             print(f"Error saving news data: {str(e)}")
             return False
-
-    def get_historical_data(self, symbol: str, days: int = None) -> pd.DataFrame:
-        """Retrieve price data"""
-        query = '''
-            SELECT date, open, high, low, close, volume
-            FROM historical_prices
-            WHERE symbol = ?
-        '''
-        params = [symbol]
-        if days:
-            query += " AND date >= date('now', ?)"
-            params.append(f'-{days} days')
-        query += " ORDER BY date ASC"
-
-        df = pd.read_sql_query(query, self.conn, params=params)
-        if not df.empty:
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index('date', inplace=True)
-        return df
-
+    def get_historical_data(self, symbol: str) -> pd.DataFrame:
+        """Get historical price data for a symbol."""
+        try:
+            with self.get_connection() as conn:
+                query = "SELECT date, open, high, low, close, volume FROM historical_data WHERE symbol = ? ORDER BY date"
+                data = conn.execute(query, (symbol,)).fetchall()
+                
+                if not data:
+                    self.logger.warning(f"No historical data found for symbol: {symbol}")
+                    return pd.DataFrame()
+                
+                df = pd.DataFrame(data, columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+                df['date'] = pd.to_datetime(df['date'])
+                df.set_index('date', inplace=True)
+                return df
+        except Exception as e:
+            self.logger.error(f"Error retrieving historical data: {str(e)}")
+            return pd.DataFrame()
+    
+    def save_model_version(self, model: Any, model_type: str, 
+                           feature_names: List[str], metrics: Dict[str, float],
+                           model_params: Dict[str, Any]) -> int:
+        """Save a trained model version."""
+        try:
+            with self.transaction() as conn:
+                model_blob = pickle.dumps(model)
+                feature_names_blob = pickle.dumps(feature_names)
+                metrics_blob = pickle.dumps(metrics)
+                model_params_blob = pickle.dumps(model_params)
+                
+                cursor = conn.execute('''
+                    INSERT INTO model_versions 
+                    (model_type, model_blob, feature_names, metrics, model_params, accuracy, precision_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    model_type, model_blob, feature_names_blob, metrics_blob, model_params_blob,
+                    metrics.get('accuracy', 0.0), metrics.get('precision', 0.0)
+                ))
+                
+                version_id = cursor.lastrowid
+                self.logger.info(f"Saved model version {version_id} successfully")
+                return version_id
+        except Exception as e:
+            self.logger.error(f"Error saving model version: {str(e)}")
+            raise
+    
+    def get_latest_model(self, version_id: Optional[int] = None) -> Tuple[int, Any, List[str], Dict[str, Any]]:
+        """Get the latest model or a specific version."""
+        try:
+            with self.get_connection() as conn:
+                if version_id:
+                    query = "SELECT * FROM model_versions WHERE version_id = ?"
+                    params = (version_id,)
+                else:
+                    query = "SELECT * FROM model_versions ORDER BY version_id DESC LIMIT 1"
+                    params = ()
+                
+                result = conn.execute(query, params).fetchone()
+                
+                if not result:
+                    self.logger.warning(f"No model found with version_id: {version_id}")
+                    return (0, None, [], {})
+                
+                model = pickle.loads(result['model_blob'])
+                feature_names = pickle.loads(result['feature_names'])
+                params = pickle.loads(result['model_params'])
+                params['model_type'] = result['model_type']
+                
+                self.logger.info(f"Loaded model version {result['version_id']} successfully")
+                return (result['version_id'], model, feature_names, params)
+        except Exception as e:
+            self.logger.error(f"Error loading model: {str(e)}")
+            return (0, None, [], {})
+    
+    def apply_migration(self, version: str, script: str) -> bool:
+        """Apply a database migration script."""
+        try:
+            with self.transaction() as conn:
+                # Check if migration was already applied
+                existing = conn.execute(
+                    "SELECT id FROM migrations WHERE version = ?", 
+                    (version,)
+                ).fetchone()
+                
+                if existing:
+                    self.logger.info(f"Migration {version} already applied")
+                    return False
+                
+                # Apply the migration
+                for statement in script.split(';'):
+                    if statement.strip():
+                        conn.execute(statement)
+                
+                # Record the migration
+                conn.execute(
+                    "INSERT INTO migrations (version) VALUES (?)",
+                    (version,)
+                )
+                
+                self.logger.info(f"Applied migration {version} successfully")
+                return True
+        except Exception as e:
+            self.logger.error(f"Migration error: {str(e)}")
+            return False
+    
     def get_latest_sentiments(self, symbol: str, limit: int = 10) -> pd.DataFrame:
         """Retrieve processed sentiment data"""
         query = '''
@@ -538,9 +679,15 @@ class Database:
         } if row else {}
 
     def close(self):
-        """Close database connection"""
-        if self.conn:
-            self.conn.close()
+        """Close all connections in the pool."""
+        for conn in self.connection_pool:
+            try:
+                conn.close()
+            except Exception as e:
+                self.logger.warning(f"Error closing connection: {str(e)}")
+        
+        self.connection_pool = []
+        self.logger.info("All database connections closed")
 
     def __enter__(self):
         return self

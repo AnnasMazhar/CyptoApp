@@ -1,45 +1,56 @@
+# config.py
 import yaml
-from pydantic import BaseModel, ValidationError
-from pathlib import Path
-from typing import Dict, Any
-
-class Settings(BaseModel):
-    database: Dict[str, Any]
-    features: Dict[str, Any]
-    models: Dict[str, Any]
-    logging: Dict[str, Any]
+import os
+from typing import Any, Dict, Optional
 
 class Config:
-    def __init__(self, env: str = 'dev'):
-        self.env = env
-        self.settings = self._load_config()
+    """Configuration management class that loads from YAML files with environment support."""
+    
+    def __init__(self, config_path: str = "config.yaml"):
+        self.config_path = config_path
+        self.config_data = {}
+        self._load_config()
+    
+    def _load_config(self) -> None:
+        """Load the configuration file."""
+        if not os.path.exists(self.config_path):
+            raise FileNotFoundError(f"Configuration file {self.config_path} not found")
         
-    def _load_config(self) -> Settings:
-        config_path = Path(__file__).parent / f"config_{self.env}.yaml"
-        try:
-            with open(config_path) as f:
-                raw_config = yaml.safe_load(f)
-                return Settings(**raw_config)
-        except (FileNotFoundError, ValidationError) as e:
-            raise RuntimeError(f"Config error: {str(e)}")
-
-# Example config_dev.yaml
-"""
-database:
-  filename: crypto_data.db
-  pool_size: 5
-features:
-  lag_periods: [1, 3, 5]
-  ta_indicators:
-    rsi_period: 14
-    macd_fast: 12
-models:
-  default: lightgbm
-  params:
-    lightgbm:
-      num_leaves: 31
-      learning_rate: 0.05
-logging:
-  level: INFO
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-"""
+        with open(self.config_path, 'r') as file:
+            self.config_data = yaml.safe_load(file)
+        
+        # Apply environment-specific overrides if available
+        env = os.environ.get("APP_ENV", "development")
+        if env in self.config_data.get("environments", {}):
+            env_config = self.config_data["environments"][env]
+            self._merge_configs(self.config_data, env_config)
+    
+    def _merge_configs(self, base: Dict[str, Any], override: Dict[str, Any]) -> None:
+        """Recursively merge override config into base config."""
+        for key, value in override.items():
+            if isinstance(value, dict) and key in base and isinstance(base[key], dict):
+                self._merge_configs(base[key], value)
+            else:
+                base[key] = value
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get a configuration value by key with optional default."""
+        keys = key.split('.')
+        value = self.config_data
+        
+        for k in keys:
+            if isinstance(value, dict) and k in value:
+                value = value[k]
+            else:
+                return default
+        
+        return value
+    
+    def validate(self, schema: Dict[str, Any]) -> bool:
+        """Validate configuration against a schema."""
+        # Basic validation implementation - could be enhanced with a schema validation library
+        for key, required in schema.items():
+            if required and self.get(key) is None:
+                return False
+        return True
+    
