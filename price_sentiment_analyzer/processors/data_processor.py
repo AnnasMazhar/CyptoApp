@@ -3,6 +3,8 @@ import numpy as np
 import logging
 from typing import Dict, List, Callable, Optional
 from database.database import Database
+from typing import Optional, List, Dict, Any, Tuple
+
 
 class DataProcessor:
     """Refactored DataProcessor with improved interfaces and validation."""
