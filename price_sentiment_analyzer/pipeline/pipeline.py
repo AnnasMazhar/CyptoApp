@@ -5,19 +5,18 @@ from typing import Dict, Tuple
 from ..processors.data_processor import DataProcessor
 from ..features.feature_engineer import FeatureEngineer
 from ..models.model_factory import ModelFactory
-from ..config.config import Config
 from ..analysis.backtester import AdvancedBacktester
-from database.database import Database
+from ..database.data_loader import DataLoader
 
 class PriceSentimentPipeline:
     def __init__(self, config_path: str = 'config.yaml'):
-        self.config = Config(config_path)
-        self.db = Database(self.config.get('database.path'))
+        self.config = config_path
+        self.db = DataLoader(self.config.get('database.path'))
         self.processor = DataProcessor(self.db, self.config.get('data_processing'))
         self.feature_engineer = FeatureEngineer(
             lag_periods=self.config.get('feature_engineering.lag_periods', [1, 3, 5])
         )
-        self.backtester = Backtester(
+        self.backtester = AdvancedBacktester(
             initial_capital=self.config.get('backtesting.initial_capital', 10000)
         )
         self.model = None

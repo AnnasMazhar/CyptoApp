@@ -1,16 +1,14 @@
 import pandas as pd
 import numpy as np
 import logging
-from typing import Dict, List, Callable, Optional
-from database.database import Database
-from typing import Optional, List, Dict, Any, Tuple
-
+from typing import Dict, List, Callable, Optional, Tuple, Any
+from ..database.data_loader import DataLoader  # Updated import
 
 class DataProcessor:
-    """Refactored DataProcessor with improved interfaces and validation."""
+    """Refactored DataProcessor using DataLoader for data access"""
     
-    def __init__(self, db: Database, config: Optional[Dict] = None):
-        self.db = db
+    def __init__(self, data_loader: DataLoader, config: Optional[Dict] = None):
+        self.data_loader = data_loader  # Changed from Database to DataLoader
         self.config = config or {}
         self.logger = logging.getLogger(__name__)
         self.cleaning_strategies = {
@@ -101,8 +99,9 @@ class DataProcessor:
     
     def load_and_clean_data(self, symbol: str, cleaning_strategy: str = 'ffill_bfill', 
                            outlier_method: str = 'iqr') -> Tuple[pd.DataFrame, Dict]:
-        """Load and preprocess data for a single symbol."""
-        df = self.db.get_historical_data(symbol)
+        """Load and preprocess data using DataLoader"""
+        # Get data through DataLoader instead of direct DB access
+        df = self.data_loader.get_historical_data(symbol)
         issues = {}
         
         if df.empty:

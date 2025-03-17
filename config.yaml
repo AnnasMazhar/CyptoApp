@@ -1,0 +1,24 @@
+# config.yaml (verified UTF-8)
+database:
+  path: crypto_data.db  # Simple path without special characters
+
+data_processing:
+  cleaning_strategy: ffill_bfill
+  outlier_method: iqr
+
+feature_engineering:
+  lag_periods: [1, 3, 5]
+  selected_features:
+    - RSI
+    - MACD
+    - volatility_30d
+
+model:
+  type: lightgbm
+  params:
+    lightgbm:
+      n_estimators: 200
+      learning_rate: 0.05
+
+forecasting:
+  days: 60

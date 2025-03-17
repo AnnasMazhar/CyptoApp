@@ -1,19 +1,12 @@
 # seed_prices.py
 
-import feedparser
-from urllib.parse import urlparse
 import pandas as pd
-import re
 from datetime import datetime
-import random
 from dateutil.relativedelta import relativedelta
-from database import Database
-from textblob import TextBlob
+from price_sentiment_analyzer.database.data_loader import DataLoader
 import requests
 import yfinance as yf
-from bs4 import BeautifulSoup
 import time
-import xml.etree.ElementTree as ET
 
 CRYPTO_MAPPING = {
     'BTC': ['bitcoin', 'btc', 'satosh', 'digital gold', 'halving',
@@ -32,22 +25,26 @@ CRYPTO_MAPPING = {
     'LINK': ['chainlink', 'link', 'oracle', 'sergey nazarov']
 }
 
-def print_db_stats(db):
+def print_db_stats(data_loader: DataLoader):
     """Display database statistics with enhanced formatting"""
     print("\n📊 Database Statistics:")
-    tables = db.get_table_names()
-    for table in tables:
-        try:
-            sample = db.get_table_sample(table, 1)
-            count = db.conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[^2_0]
-            print(f"- {table.upper():<20} {count:>6} records")
-            if not sample.empty:
-                print(f"  Latest entry: {sample.iloc[^2_0]['date'] if 'date' in sample else 'N/A'}")
-        except Exception as e:
-            print(f"- {table.upper():<20} : Error - {str(e)}")
+    try:
+        with data_loader._get_connection() as conn:
+            tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            for table in tables:
+                table_name = table[0]
+                count = conn.execute(f'SELECT COUNT(*) FROM {table_name}').fetchone()[0]
+                print(f"- {table_name.upper():<20} {count:>6} records")
+                if table_name == 'historical_prices':
+                    latest = conn.execute(
+                        'SELECT MAX(date) FROM historical_prices'
+                    ).fetchone()[0]
+                    print(f"  Latest historical entry: {latest}")
+    except Exception as e:
+        print(f"Error getting stats: {str(e)}")
 
-def seed_historical_prices(db):
-    """Fixed price seeding implementation"""
+def seed_historical_prices(data_loader: DataLoader, years=20):
+    """Fixed price seeding implementation for the last 'years' years."""
     crypto_config = {
         'BTC': {'sources': ['yfinance', 'coingecko'], 'start': '2010-07-17'},
         'ETH': {'sources': ['yfinance', 'coingecko'], 'start': '2015-08-07'},
@@ -61,15 +58,18 @@ def seed_historical_prices(db):
         'LINK': {'sources': ['yfinance', 'coingecko'], 'start': '2017-09-20'}
     }
 
+    end_date = datetime.now()
+    start_date = end_date - relativedelta(years=years)
+
     for symbol, config in crypto_config.items():
         print(f"\n🔨 Processing {symbol} historical prices...")
         dfs = []
         for source in config['sources']:
             try:
                 if source == 'yfinance':
-                    df = fetch_yfinance(symbol)
+                    df = fetch_yfinance(symbol, start_date, end_date)
                 elif source == 'coingecko':
-                    df = fetch_coingecko(symbol)
+                    df = fetch_coingecko(symbol, start_date, end_date)
 
                 if not df.empty:
                     print(f"✅ {source}: Found {len(df)} raw records")
@@ -81,29 +81,15 @@ def seed_historical_prices(db):
 
         if dfs:
             try:
-                combined_df = pd.concat(dfs, ignore_index=True) # Important: Reset Index
+                combined_df = pd.concat(dfs, ignore_index=True)
                 prepared_df = prepare_dataframe(combined_df, symbol)
 
-                if prepared_df is not None and not prepared_df.empty:
-
-                    # Get initial count
-                    initial_count = db.conn.execute(
-                        'SELECT COUNT(*) FROM historical_prices WHERE symbol = ?',
-                        (symbol,)
-                    ).fetchone()[^2_0]
-
-                    # Save data
-                    success = db.save_historical_data(symbol, prepared_df)
-
+                if not prepared_df.empty:
+                    success = data_loader.save_historical_data(symbol, prepared_df)
+                    
                     if success:
-                        # Get final count
-                        final_count = db.conn.execute(
-                            'SELECT COUNT(*) FROM historical_prices WHERE symbol = ?',
-                            (symbol,)
-                        ).fetchone()[^2_0]
-                        inserted = final_count - initial_count
-                        print(f"💾 Inserted {inserted} new records for {symbol}")
-                        print(f"Database now has {final_count} total records for {symbol}")
+                        df = data_loader.get_historical_data(symbol)
+                        print(f"💾 Total records for {symbol}: {len(df)}")
                     else:
                         print("❌ Database save failed")
                 else:
@@ -117,75 +103,57 @@ def prepare_dataframe(df, symbol):
     """Ensure DataFrame matches database schema EXACTLY"""
     required_columns = ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume']
     try:
-        # Check for required columns BEFORE any processing
-        missing_columns = [col for col in required_columns if col not in df.columns and col != 'symbol']  #Exclude symbol as we add this
+        missing_columns = [col for col in required_columns if col not in df.columns and col != 'symbol']
         if missing_columns:
             print(f"⚠️ Missing columns in DataFrame: {missing_columns}")
             return None
 
-        # Rename columns to lowercase
         df.columns = df.columns.str.lower()
 
-        # Process date first
-        if 'date' in df.columns: #Ensure date exists after potential renaming
+        if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.strftime('%Y-%m-%d')
         else:
             print("⚠️ 'date' column missing after renaming.")
             return None
 
-        # Add symbol column
         df['symbol'] = symbol
-
-        # Ensure correct column order
         df = df[required_columns]
 
-        # Validate numeric columns
         numeric_cols = ['open', 'high', 'low', 'close', 'volume']
         for col in numeric_cols:
-            if col in df.columns: #Check if column exists before converting
+            if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             else:
                 print(f"⚠️ Numeric column '{col}' missing.")
                 return None
 
-        # Final cleanup
         df = df.drop_duplicates(['symbol', 'date']).dropna()
-
         print(f"✅ Validated columns: {list(df.columns)}")
-        print(df.head())  # Print the first few rows of the DataFrame
         return df
     except Exception as e:
         print(f"❌ Data preparation failed: {str(e)}")
         return None
 
-def fetch_yfinance(symbol):
-    """Fetch and normalize Yahoo Finance data"""
+def fetch_yfinance(symbol, start_date, end_date):
+    """Fetch and normalize Yahoo Finance data for a specified date range."""
     try:
         ticker = yf.Ticker(f"{symbol}-USD")
-        df = ticker.history(period="max").reset_index()
-
-        # Rename and order columns - Ensure Date is handled correctly
-        if 'Date' in df.columns:
-            df = df.rename(columns={'Date': 'date'})
-        else:
-            print("⚠️ 'Date' column not found in yfinance data.")
-            return pd.DataFrame()
-
-        df = df[['date', 'Open', 'High', 'Low', 'Close', 'Volume']]  # Select columns before renaming
+        df = ticker.history(start=start_date, end=end_date).reset_index()
         df = df.rename(columns={
+            'Date': 'date',
             'Open': 'open',
             'High': 'high',
             'Low': 'low',
             'Close': 'close',
             'Volume': 'volume'
         })
-        return df
+        return df[['date', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
         print(f"❌ YFinance error: {str(e)}")
         return pd.DataFrame()
 
-def fetch_coingecko(symbol):
-    """Fetch historical data from CoinGecko with proper error handling"""
+def fetch_coingecko(symbol, start_date, end_date):
+    """Fetch historical data from CoinGecko for a specified date range."""
     coin_ids = {
         'BTC': 'bitcoin',
         'ETH': 'ethereum',
@@ -205,35 +173,27 @@ def fetch_coingecko(symbol):
 
     try:
         coin_id = coin_ids[symbol]
+        start_timestamp = int(start_date.timestamp())
+        end_timestamp = int(end_date.timestamp())
         url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
-        params = {'vs_currency': 'usd', 'days': 'max'}
+        params = {'vs_currency': 'usd', 'from': start_timestamp, 'to': end_timestamp}
         response = requests.get(url, params=params, timeout=20)
         data = response.json()
         df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close'])
-        df['date'] = pd.to_datetime(df['timestamp'], unit='ms').dt.strftime('%Y-%m-%d')
-        df['volume'] = 0  # CoinGecko doesn't provide historical volume
-
-        return pd.DataFrame({
-            'date': df['date'],
-            'open': df['open'],
-            'high': df['high'],
-            'low': df['low'],
-            'close': df['close'],
-            'volume': [^2_0] * len(df)  # CoinGecko doesn't provide volume
-        })
+        df['date'] = pd.to_datetime(df['timestamp'], unit='s').dt.strftime('%Y-%m-%d')
+        return df[['date', 'open', 'high', 'low', 'close']].assign(volume=0)
     except Exception as e:
         print(f"❌ CoinGecko error: {str(e)}")
         return pd.DataFrame()
 
-def seed_and_verify():
+def seed_and_verify(config_path='config.yaml', years=20):
     """Improved seeding with proper validation"""
-    db = Database()
+    data_loader = DataLoader(config_path)  # Use config path from argument
     print("🚀 Starting data seeding...")
-    seed_historical_prices(db)
+    seed_historical_prices(data_loader, years)
     print("\n✅ Seeding complete!")
-    print_db_stats(db)
+    print_db_stats(data_loader)
 
 if __name__ == "__main__":
     seed_and_verify()
-    
-    
+
