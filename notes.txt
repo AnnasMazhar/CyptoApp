@@ -1,0 +1,517 @@
+
+import scrapy
+from scrapy.utils.project import get_project_settings
+import datetime
+import logging
+from typing import List, Dict
+import pandas as pd
+import re
+from urllib.parse import urlparse, urljoin
+import newspaper
+from newspaper import Article
+
+# Assuming your database and data_loader are in price_sentiment_analyzer.database
+from price_sentiment_analyzer.database.data_loader import DataLoader
+
+CRYPTO_MAPPING = {
+    'BTC': ['bitcoin', 'btc', 'satosh', 'digital gold', 'halving',
+            'store of value', 'sha-256', 'bit coin', '₿', 'lightning network',
+            'segwit', 'taproot'],
+    'ETH': ['ethereum', 'eth', 'vitalik', 'smart contract', 'dapp',
+            'gas fee', 'merge', 'pos', 'shapella', 'danksharding',
+            'erc-20', 'defi'],
+    'BNB': ['binance', 'bnb', 'cz', 'exchange coin'],
+    'XRP': ['xrp', 'ripple', 'brad garlinghouse', 'cross-border'],
+    'ADA': ['cardano', 'ada', 'charles hoskinson', 'ouroboros'],
+    'DOGE': ['dogecoin', 'doge', 'shiba', 'meme coin'],
+    'SOL': ['solana', 'sol', 'anatoly yakovenko', 'high throughput'],
+    'DOT': ['polkadot', 'dot', 'gavin wood', 'parachain'],
+    'UNI': ['uniswap', 'uni', 'dex', 'automated market maker'],
+    'LINK': ['chainlink', 'link', 'oracle', 'sergey nazarov']
+}
+
+class CryptoNewsSpider(scrapy.Spider):
+    name = 'crypto_news'
+
+    def __init__(self, *args, **kwargs):
+        super(CryptoNewsSpider, self).__init__(*args, **kwargs)
+        settings = get_project_settings()
+        self.config_path = settings.get('CONFIG_PATH', 'config.yaml')
+        self.data_loader = DataLoader(self.config_path)
+        self.start_urls = self.get_start_urls()
+        self.logger = logging.getLogger(__name__)
+
+    def get_start_urls(self):
+        # Example: Using Google News RSS feeds (free and widely available)
+        base_url = "https://news.google.com/rss/search?q={}&hl=en-US&gl=US&ceid=US:en"
+        urls = []
+        for keywords in CRYPTO_MAPPING.values():
+            query = " OR ".join(keywords)
+            urls.append(base_url.format(query))
+        return urls
+
+    def parse(self, response):
+        for item in response.xpath('//item'):
+            article_url = item.xpath('link/text()').get()
+            if article_url:
+                yield scrapy.Request(article_url, callback=self.parse_article)
+
+    def parse_article(self, response):
+        try:
+            article = Article(response.url)
+            article.download()
+            article.parse()
+            article.nlp()
+
+            published_at = article.publish_date if article.publish_date else datetime.datetime.now()
+            source_name = urlparse(response.url).netloc
+
+            for symbol, keywords in CRYPTO_MAPPING.items():
+                if any(keyword.lower() in article.text.lower() or keyword.lower() in article.title.lower() for keyword in keywords):
+                    yield {
+                        'symbol': symbol,
+                        'published_at': published_at.isoformat(),
+                        'title': article.title,
+                        'content': article.text,
+                        'source': source_name,
+                        'sentiment_positive': article.summary.count('positive'), # Replace with your sentiment analysis
+                        'sentiment_negative': article.summary.count('negative'), # Replace with your sentiment analysis
+                        'sentiment_neutral': article.summary.count('neutral') # Replace with your sentiment analysis
+                    }
+
+        except newspaper.ArticleException as e:
+            self.logger.warning(f"Failed to parse article {response.url}: {e}")
+        except Exception as e:
+            self.logger.error(f"Error processing article {response.url}: {e}")
+
+    def closed(self, reason):
+        if reason == 'finished':
+            self.logger.info("Scraping completed. Saving data to database.")
+            articles = list(self.crawler.stats.get_value('item_scraped_count', 0))
+            if articles > 0 :
+                items = list(self.crawler.spider.crawler.engine.slot.inprogress)
+                saved = self.data_loader.save_news_data(items)
+                if saved:
+                    self.logger.info(f"Successfully saved {articles} articles to database.")
+                else:
+                    self.logger.error("Failed to save articles to database.")
+            else:
+                self.logger.info("No articles scraped.")
+        else:
+            self.logger.warning(f"Scraping stopped: {reason}")
+
+# Add these imports
+from scrapy.downloadermiddlewares.retry import RetryMiddleware
+from scrapy.utils.response import response_status_message
+import random
+import time
+from fake_useragent import UserAgent
+from scrapy.http import HtmlResponse
+
+# Define a custom Retry Middleware with exponential backoff
+class CustomRetryMiddleware(RetryMiddleware):
+    def __init__(self, settings):
+        super(CustomRetryMiddleware, self).__init__(settings)
+        self.max_retry_times = settings.getint('RETRY_TIMES', 3)
+        self.retry_http_codes = set(int(x) for x in settings.getlist('RETRY_HTTP_CODES', []))
+        self.priority_adjust = settings.getint('RETRY_PRIORITY_ADJUST', -1)
+        # Add exponential backoff
+        self.initial_backoff = settings.getfloat('INITIAL_BACKOFF', 5)
+        self.max_backoff = settings.getfloat('MAX_BACKOFF', 120)
+
+    def _retry(self, request, reason, spider):
+        retries = request.meta.get('retry_times', 0) + 1
+        
+        if retries <= self.max_retry_times:
+            # Calculate exponential backoff time
+            backoff_time = min(self.initial_backoff * (2 ** (retries - 1)), self.max_backoff)
+            # Add jitter (±20%)
+            backoff_time = backoff_time * (0.8 + random.random() * 0.4)
+            
+            spider.logger.warning(f"Retrying {request.url} (retry: {retries}/{self.max_retry_times}) with {backoff_time:.2f}s backoff")
+            time.sleep(backoff_time)
+            
+            retryreq = request.copy()
+            retryreq.meta['retry_times'] = retries
+            retryreq.meta['max_retry_times'] = self.max_retry_times
+            retryreq.dont_filter = True
+            
+            # Rotate user agent for each retry
+            ua = UserAgent()
+            retryreq.headers['User-Agent'] = ua.random
+            
+            return retryreq
+        else:
+            spider.logger.error(f"Gave up retrying {request.url} ({reason})")
+            return None
+
+# Define a middleware for random delays and user agent rotation
+class RandomDelayMiddleware:
+    def __init__(self, settings):
+        self.min_delay = settings.getfloat('RANDOM_DELAY_MIN', 1.0)
+        self.max_delay = settings.getfloat('RANDOM_DELAY_MAX', 5.0)
+        self.ua = UserAgent()
+        self.debug = settings.getbool('RANDOM_DELAY_DEBUG', False)
+        self.auth_enabled = settings.getbool('HTTP_PROXY_AUTH_ENABLED', False)
+        self.proxies = self._load_proxies(settings.get('PROXY_LIST_PATH', None))
+        
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(crawler.settings)
+        
+    def _load_proxies(self, path):
+        """Load proxy list from file"""
+        if not path:
+            return []
+            
+        try:
+            with open(path, 'r') as f:
+                return [line.strip() for line in f if line.strip()]
+        except Exception:
+            return []
+        
+    def process_request(self, request, spider):
+        # Add random delay
+        delay = random.uniform(self.min_delay, self.max_delay)
+        if self.debug:
+            spider.logger.info(f"Random delay: {delay:.2f}s for {request.url}")
+        time.sleep(delay)
+        
+        # Rotate user agent
+        request.headers['User-Agent'] = self.ua.random
+        
+        # Rotate proxy if available
+        if self.proxies and random.random() < 0.7:  # 70% chance to use proxy
+            proxy = random.choice(self.proxies)
+            request.meta['proxy'] = proxy
+            if self.debug:
+                spider.logger.info(f"Using proxy: {proxy} for {request.url}")
+                
+        # Add random request headers
+        request.headers['Accept-Language'] = random.choice([
+            'en-US,en;q=0.9', 'en-GB,en;q=0.8', 'en-CA,en;q=0.7', 
+            'en-AU,en;q=0.6', 'en;q=0.5'
+        ])
+        
+        # Randomize accept header
+        request.headers['Accept'] = random.choice([
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+        ])
+        
+        # Add random referer from major websites
+        referers = [
+            'https://www.google.com/', 'https://www.bing.com/', 
+            'https://www.yahoo.com/', 'https://www.reddit.com/',
+            'https://twitter.com/', 'https://www.facebook.com/'
+        ]
+        if random.random() < 0.7:  # 70% chance to add referer
+            request.headers['Referer'] = random.choice(referers)
+
+# Define settings in settings.py
+"""
+# Add these to your settings.py
+
+# Enable Random Delay Middleware
+DOWNLOADER_MIDDLEWARES = {
+    'scrapy.downloadermiddlewares.retry.RetryMiddleware': None,
+    'your_project.middlewares.CustomRetryMiddleware': 550,
+    'your_project.middlewares.RandomDelayMiddleware': 551,
+}
+
+# Crawl responsibly
+ROBOTSTXT_OBEY = True
+
+# Basic anti-detection settings
+DOWNLOAD_DELAY = 2
+RANDOMIZE_DOWNLOAD_DELAY = True
+CONCURRENT_REQUESTS = 1
+CONCURRENT_REQUESTS_PER_DOMAIN = 1
+AUTOTHROTTLE_ENABLED = True
+AUTOTHROTTLE_START_DELAY = 5
+AUTOTHROTTLE_MAX_DELAY = 60
+AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
+AUTOTHROTTLE_DEBUG = False
+
+# Custom retry settings
+RETRY_TIMES = 3
+RETRY_HTTP_CODES = [500, 502, 503, 504, 522, 524, 408, 429, 403]
+INITIAL_BACKOFF = 5
+MAX_BACKOFF = 120
+
+# Random delay settings
+RANDOM_DELAY_MIN = 1.0
+RANDOM_DELAY_MAX = 5.0
+RANDOM_DELAY_DEBUG = False
+
+# Cache settings to avoid requesting the same page twice
+HTTPCACHE_ENABLED = True
+HTTPCACHE_EXPIRATION_SECS = 86400  # 24 hours
+HTTPCACHE_DIR = 'httpcache'
+HTTPCACHE_IGNORE_HTTP_CODES = [403, 429, 500, 502, 503, 504]
+HTTPCACHE_STORAGE = 'scrapy.extensions.httpcache.FilesystemCacheStorage'
+
+# Proxy settings (if using proxies)
+#PROXY_LIST_PATH = 'proxies.txt'
+#HTTP_PROXY_AUTH_ENABLED = False
+"""
+
+# Update your CryptoNewsSpider class to implement request throttling per domain
+class CryptoNewsSpider(scrapy.Spider):
+    name = 'crypto_news'
+    
+    def __init__(self, *args, **kwargs):
+        super(CryptoNewsSpider, self).__init__(*args, **kwargs)
+        # Previous initialization code...
+        
+        # Add domain-specific request tracking
+        self.domain_requests = {}
+        self.domain_last_request = {}
+        self.domain_request_times = {}
+        
+    def get_start_urls(self):
+        # Previous code...
+        return urls
+        
+    def start_requests(self):
+        """Override start_requests to add domain-specific delays"""
+        for url in self.start_urls:
+            domain = urlparse(url).netloc
+            yield self._create_request_with_delay(url, domain)
+    
+    def _create_request_with_delay(self, url, domain):
+        """Create a new request with domain-specific throttling"""
+        # Update domain request counts
+        self.domain_requests[domain] = self.domain_requests.get(domain, 0) + 1
+        
+        # Calculate delay based on domain history
+        now = time.time()
+        delay = 0
+        
+        if domain in self.domain_last_request:
+            # Calculate time since last request
+            time_since_last = now - self.domain_last_request[domain]
+            
+            # Adjust delay based on number of requests to this domain
+            request_count = self.domain_requests[domain]
+            
+            # More aggressive throttling for domains we've hit frequently
+            if request_count > 10:
+                min_delay = 5 + (request_count - 10) * 0.5  # Increases with request count
+                if time_since_last < min_delay:
+                    delay = min_delay - time_since_last
+        
+        # Update last request time for this domain
+        self.domain_last_request[domain] = now + delay
+        
+        # Create the request
+        req = scrapy.Request(url, callback=self.parse, dont_filter=False)
+        
+        # If delay is needed, add it to the request
+        if delay > 0:
+            self.logger.debug(f"Adding {delay:.2f}s delay for {domain} (request #{self.domain_requests[domain]})")
+            req.meta['download_slot'] = domain  # Force separate download slot
+            req.meta['download_delay'] = delay
+            
+        return req
+    
+    def parse(self, response):
+        # Track request timing
+        domain = urlparse(response.url).netloc
+        if domain not in self.domain_request_times:
+            self.domain_request_times[domain] = []
+        self.domain_request_times[domain].append(time.time())
+        
+        # Regular parsing logic...
+        for item in response.xpath('//item'):
+            article_url = item.xpath('link/text()').get()
+            if article_url:
+                article_domain = urlparse(article_url).netloc
+                yield self._create_request_with_delay(article_url, article_domain)
+                
+    def parse_article(self, response):
+        # Previous logic...
+        pass
+
+
+
+
+
+        # news sources
+        def get_start_urls(self):
+    """Get start URLs from multiple sources"""
+    urls = []
+    
+    # 1. Google News (already implemented)
+    base_url = "https://news.google.com/rss/search?q={}&hl=en-US&gl=US&ceid=US:en"
+    for keywords in CRYPTO_MAPPING.values():
+        query = " OR ".join(keywords)
+        urls.append(base_url.format(query))
+    
+    # 2. Dedicated crypto news sites with RSS feeds
+    crypto_news_feeds = [
+        "https://cointelegraph.com/rss",
+        "https://cryptonews.com/news/feed/",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://decrypt.co/feed",
+        "https://bitcoinmagazine.com/feed",
+        "https://news.bitcoin.com/feed/",
+        "https://cryptoslate.com/feed/",
+        "https://ambcrypto.com/feed/",
+        "https://blockonomi.com/feed/",
+        "https://cryptopotato.com/feed/"
+    ]
+    urls.extend(crypto_news_feeds)
+    
+    # 3. Twitter API (if you have API access)
+    # This would require separate implementation using Twitter API
+    
+    # 4. Reddit API for crypto subreddits
+    reddit_feeds = [
+        "https://www.reddit.com/r/Bitcoin/.rss",
+        "https://www.reddit.com/r/CryptoCurrency/.rss",
+        "https://www.reddit.com/r/ethereum/.rss",
+        "https://www.reddit.com/r/CryptoMarkets/.rss"
+    ]
+    urls.extend(reddit_feeds)
+    
+    # 5. Financial news sites with crypto sections
+    financial_feeds = [
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Crypto
+        "https://www.forbes.com/crypto-blockchain/feed/",  # Forbes Crypto
+        "https://www.bloomberg.com/topics/cryptocurrency.rss"  # Bloomberg Crypto
+    ]
+    urls.extend(financial_feeds)
+    
+    return urls
+
+def parse(self, response):
+    """Parse different types of sources"""
+    # Detect source type and use appropriate parser
+    source_domain = urlparse(response.url).netloc
+    
+    # Google News format
+    if 'news.google.com' in source_domain:
+        for item in response.xpath('//item'):
+            article_url = item.xpath('link/text()').get()
+            if article_url:
+                yield scrapy.Request(article_url, callback=self.parse_article)
+    
+    # Reddit format
+    elif 'reddit.com' in source_domain:
+        for item in response.xpath('//entry'):
+            title = item.xpath('title/text()').get()
+            content = item.xpath('content/text()').get()
+            url = item.xpath('link/@href').get()
+            author = item.xpath('author/name/text()').get()
+            published = item.xpath('published/text()').get()
+            
+            # Process Reddit data directly
+            if title and content:
+                for symbol, keywords in CRYPTO_MAPPING.items():
+                    if any(keyword.lower() in (title + content).lower() for keyword in keywords):
+                        # Process Reddit entry
+                        yield {
+                            'symbol': symbol,
+                            'published_at': published,
+                            'title': title,
+                            'content': content,
+                            'source': 'reddit.com',
+                            'author': author,
+                            'url': url,
+                            # Add sentiment analysis
+                        }
+    
+    # Standard RSS feed format
+    else:
+        for item in response.xpath('//item'):
+            title = item.xpath('title/text()').get()
+            description = item.xpath('description/text()').get() 
+            link = item.xpath('link/text()').get()
+            
+            # Some RSS feeds include full content - use if available
+            if description and len(description) > 500:
+                # Process content directly from feed
+                for symbol, keywords in CRYPTO_MAPPING.items():
+                    if any(keyword.lower() in (title + description).lower() for keyword in keywords):
+                        pubdate = item.xpath('pubDate/text()').get()
+                        # Convert pubDate to ISO format
+                        try:
+                            dt = datetime.datetime.strptime(pubdate, '%a, %d %b %Y %H:%M:%S %z')
+                            published_at = dt.isoformat()
+                        except (ValueError, TypeError):
+                            published_at = datetime.datetime.now().isoformat()
+                            
+                        yield {
+                            'symbol': symbol,
+                            'published_at': published_at,
+                            'title': title,
+                            'content': description,
+                            'source': source_domain,
+                            'url': link,
+                            # Add sentiment analysis
+                        }
+            # Otherwise, follow the link to get full content
+            elif link:
+                yield scrapy.Request(link, callback=self.parse_article, 
+                                    meta={'source_domain': source_domain})
+
+
+    sentiment analysis features
+    from textblob import TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+def analyze_sentiment(text):
+    # Using both TextBlob and VADER for more robust analysis
+    # TextBlob analysis
+    blob = TextBlob(text)
+    textblob_polarity = blob.sentiment.polarity  # Range: -1 to 1
+    
+    # VADER analysis (specifically tuned for social media content)
+    analyzer = SentimentIntensityAnalyzer()
+    vader_scores = analyzer.polarity_scores(text)
+    
+    # Combined approach
+    sentiment_scores = {
+        'textblob_polarity': textblob_polarity,
+        'vader_compound': vader_scores['compound'],
+        'vader_positive': vader_scores['pos'],
+        'vader_negative': vader_scores['neg'],
+        'vader_neutral': vader_scores['neu']
+    }
+    
+    # Crypto-specific sentiment modifications
+    # Adjust for crypto terms that might be miscategorized
+    crypto_sentiment_terms = {
+        'bullish': 0.3,
+        'bearish': -0.3,
+        'moon': 0.4,
+        'dump': -0.4,
+        'hodl': 0.2,
+        'fud': -0.3,
+        'scam': -0.5,
+        'hack': -0.5,
+        'regulation': -0.2,
+        'adoption': 0.4,
+        'institutional': 0.3
+    }
+    
+    # Adjust sentiment based on crypto-specific terms
+    for term, impact in crypto_sentiment_terms.items():
+        if term.lower() in text.lower():
+            sentiment_scores['crypto_adjusted_score'] = sentiment_scores.get('crypto_adjusted_score', 0) + impact
+    
+    return sentiment_scores
+
+
+    sentiment_scores = analyze_sentiment(article.text)
+yield {
+    'symbol': symbol,
+    'published_at': published_at.isoformat(),
+    'title': article.title,
+    'content': article.text,
+    'source': source_name,
+    'sentiment_scores': sentiment_scores
+}
+
