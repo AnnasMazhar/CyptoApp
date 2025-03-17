@@ -1,27 +1,51 @@
 # prediction_pipeline.py
 import pandas as pd
 import numpy as np
+import yaml
 from typing import Dict, Tuple
-from ..processors.data_processor import DataProcessor
-from ..features.feature_engineer import FeatureEngineer
-from ..models.model_factory import ModelFactory
-from ..analysis.backtester import AdvancedBacktester
-from ..database.data_loader import DataLoader
+import logging
+from price_sentiment_analyzer.processors.data_processor import DataProcessor
+from price_sentiment_analyzer.features.feature_engineer import FeatureEngineer
+from price_sentiment_analyzer.models.model_factory import ModelFactory
+from price_sentiment_analyzer.analysis.backtester import AdvancedBacktester
+from price_sentiment_analyzer.database.data_loader import DataLoader
 
 class PriceSentimentPipeline:
     def __init__(self, config_path: str = 'config.yaml'):
-        self.config = config_path
-        self.db = DataLoader(self.config.get('database.path'))
-        self.processor = DataProcessor(self.db, self.config.get('data_processing'))
-        self.feature_engineer = FeatureEngineer(
-            lag_periods=self.config.get('feature_engineering.lag_periods', [1, 3, 5])
-        )
-        self.backtester = AdvancedBacktester(
-            initial_capital=self.config.get('backtesting.initial_capital', 10000)
-        )
-        self.model = None
-        self.features = None
-        self.scaler = None
+        self.logger = logging.getLogger(__name__) #initialize the logger.
+        self.logger.setLevel(logging.ERROR) #set the log level.
+        try:
+            with open(config_path, 'r') as f:
+                self.config = yaml.safe_load(f)
+        except FileNotFoundError:
+            self.logger.error(f"Error: Config file not found at {config_path}")
+            self.config = None
+            return
+        except yaml.YAMLError as e:
+            self.logger.error(f"Error parsing YAML config: {e}")
+            self.config = None
+            return
+
+        if self.config is not None:
+            try:
+                self.db = DataLoader(config_path)
+                self.processor = DataProcessor(self.db, self.config.get('data_processing'))
+                self.feature_engineer = FeatureEngineer(
+                    lag_periods=self.config.get('feature_engineering.lag_periods', [1, 3, 5])
+                )
+                self.backtester = AdvancedBacktester(
+                    initial_capital=self.config.get('backtesting.initial_capital', 10000)
+                )
+                self.model = ModelFactory.create_model(
+                                model_type,
+                                params=self.config.get('model', {}).get('params', {}).get(model_type, {})
+)
+                self.features = None
+                self.scaler = None
+            except Exception as e:
+                self.logger.error(f"Error during pipeline initialization: {e}")
+                self.config = None
+                return
 
     def run_pipeline(self, symbol: str) -> Tuple[Dict, pd.Series]:
         """Complete training and forecasting workflow"""

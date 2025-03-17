@@ -36,15 +36,15 @@ class Database:
 
 
     @contextmanager
-    def _get_connection(self):
-        """Connection context manager for schema operations"""
+    def get_connection(self):  # Renamed from _get_connection
+        """Public connection context manager"""
         conn = None
         try:
             conn = sqlite3.connect(self.db_path)
             conn.execute("PRAGMA foreign_keys = ON")
             yield conn
         except sqlite3.Error as e:
-            self.logger.error(f"Connection error (path: {self.db_path}): {str(e)}")
+            self.logger.error(f"Connection error: {str(e)}")
             raise
         finally:
             if conn:
@@ -272,18 +272,7 @@ class Database:
 
     #Utility
     def get_table_names(self) -> List[str]:
-        """List all tables in the database, adhering to the connection pool."""
-        table_names = []
-        try:
-            with self.get_connection() as conn:  # Use the connection pool
-                cursor = conn.cursor()
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                tables = cursor.fetchall()
-                table_names = [table[0] for table in tables]
-        except sqlite3.Error as e:
-            self.logger.error(f"Database error in get_table_names: {e}")
-            return []
-        except Exception as e:
-            self.logger.error(f"Unexpected error in get_table_names: {e}")
-            return []
-        return table_names
+        with self.get_connection() as conn:  # Fixed method name
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            return [row[0] for row in cursor.fetchall()]

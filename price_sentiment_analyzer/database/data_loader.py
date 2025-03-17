@@ -4,6 +4,7 @@ import joblib
 import time
 import json
 import logging
+from database import Database
 import yaml
 from contextlib import contextmanager
 from typing import Optional, Dict, Any, List, Tuple
@@ -11,92 +12,51 @@ import pandas as pd
 
 class DataLoader:
     """Handles all database query operations with logging and connection management"""
-    def __init__(self, config_path: str = 'config.yaml'):
+    
+    def __init__(self, database: Database): 
+        self.database = database
         self.logger = logging.getLogger(f"{__name__}.DataLoader")
-        try:
-            config = self._load_config(config_path)
-            self.db_path = config['database']['path']
-            self.logger.info(f"Initialized DataLoader for database: {self.db_path}")
-        except Exception as e:
-            self.logger.error(f"Initialization failed: {str(e)}")
-            raise
+        self.metrics = {
+            'queries': 0,
+            'transactions': 0,
+            'errors': 0
+        }
+
     @contextmanager
     def _get_connection(self):
-        """Connection context manager with error handling"""
-        conn = None
-        try:
-            conn = sqlite3.connect(self.db_path)
+        """Use Database's connection with row factory"""
+        with self.database.get_connection() as conn:
             conn.row_factory = sqlite3.Row
             yield conn
-        except sqlite3.Error as e:
-            self.logger.error(f"Connection error: {str(e)}")
-            raise
-        finally:
-            if conn:
-                conn.close()
+
     @contextmanager
     def _transaction(self):
         start_time = time.time()
-        with self._get_connection() as conn:
-            try:
+        self.metrics['transactions'] += 1
+        try:
+            with self._get_connection() as conn:
                 yield conn
                 conn.commit()
                 self.logger.info(f"Transaction committed in {time.time() - start_time:.2f}s")
-            except Exception as e:
-                conn.rollback()
-                self.logger.error(f"Rollback after {time.time() - start_time:.2f}s: {e}")
-                raise
-
-    @contextmanager
-    def _transaction(self):
-        """Transaction context manager with rollback handling"""
-        with self._get_connection() as conn:
-            try:
-                yield conn
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                self.logger.error(f"Transaction rolled back: {str(e)}")
-                raise
+        except Exception as e:
+            self.metrics['errors'] += 1
+            conn.rollback()
+            self.logger.error(f"Rollback after {time.time() - start_time:.2f}s: {e}")
+            raise
 
     # Historical Price Data Methods
     def get_historical_data(self, symbol: str) -> pd.DataFrame:
-        """Safer historical data retrieval"""
         self.logger.info(f"Fetching historical data for {symbol}")
         try:
             with self._get_connection() as conn:
-                # Verify table exists first
-                table_exists = conn.execute('''
-                    SELECT count(*) FROM sqlite_master 
-                    WHERE type='table' AND name='historical_prices'
-                ''').fetchone()[0]
-                
-                if not table_exists:
-                    self.logger.error("historical_prices table does not exist")
-                    return pd.DataFrame()
-                
-                # Parameterized query with explicit column names
-                query = '''
-                    SELECT 
-                        date, 
-                        open, 
-                        high, 
-                        low, 
-                        close, 
-                        volume 
-                    FROM historical_prices 
-                    WHERE symbol = :symbol
-                    ORDER BY date
-                '''
+                # Removed table existence check
+                query = '''SELECT date, open, high, low, close, volume 
+                        FROM historical_prices WHERE symbol = :symbol'''
                 df = pd.read_sql_query(query, conn, params={'symbol': symbol})
                 df['date'] = pd.to_datetime(df['date'])
                 return df.set_index('date')
-            
         except sqlite3.Error as e:
             self.logger.error(f"SQL Error: {str(e)}")
-            return pd.DataFrame()
-        except Exception as e:
-            self.logger.error(f"Unexpected error: {str(e)}")
             return pd.DataFrame()
 
     def save_historical_data(self, symbol: str, data: pd.DataFrame) -> bool:
@@ -121,15 +81,22 @@ class DataLoader:
         data['symbol'] = symbol
         return data.dropna(subset=['date', 'symbol']).drop_duplicates()
 
+    
     def _upsert_historical_data(self, conn, data: pd.DataFrame):
-        """Perform upsert operation for historical data"""
-        data.to_sql('temp_prices', conn, if_exists='replace', index=False)
-        conn.execute('''
-            INSERT OR IGNORE INTO historical_prices
-            SELECT date, open, high, low, close, volume, symbol 
-            FROM temp_prices
-        ''')
-        conn.execute('DROP TABLE IF EXISTS temp_prices')
+        """Direct upsert using executemany"""
+        tuples = [tuple(x) for x in data[['symbol',
+                                          'date',
+                                          'open',
+                                          'high',
+                                          'low',
+                                          'close',
+                                          'volume'].values]
+                    ]
+        conn.executemany('''
+            INSERT OR REPLACE INTO historical_prices 
+            (symbol, date, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', tuples)
 
     # Model Management Methods
     def save_model_version(self, model: Any, metrics: Dict[str, float], 

@@ -1,7 +1,5 @@
-from ..models.model_interface import LightGBMModel
-from ..models.model_interface import RandomForestModel
-from ..models.model_interface import XGBoostModel
-from ..models.model_interface import ModelInterface
+
+from .model_interface import LightGBMModel, RandomForestModel, XGBoostModel, ModelInterface
 from typing import Optional, Dict, Any
 
 

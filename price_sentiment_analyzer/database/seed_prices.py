@@ -3,7 +3,7 @@
 import pandas as pd
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from price_sentiment_analyzer.database.data_loader import DataLoader
+from data_loader import DataLoader
 import requests
 import yfinance as yf
 import time

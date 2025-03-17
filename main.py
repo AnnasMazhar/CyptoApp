@@ -1,5 +1,6 @@
 import argparse
 import logging
+import sqlite3
 import os
 from pathlib import Path
 import numpy as np
@@ -37,7 +38,7 @@ def load_config(config_path: str) -> dict:
         logging.error(f"Failed to load config: {str(e)}")
         raise
 
-def seed_demo_data(config_path: str):
+def seed_data(config_path: str):
     """Seed database using external data sources"""
     logger = logging.getLogger(__name__)
     try:
@@ -127,30 +128,67 @@ def seed_demo_data(data_loader: DataLoader):
         logger.error(f"Data seeding failed: {str(e)}")
         raise
 
-def view_table_sample(data_loader: DataLoader, table_name: str, sample_size: int = 10):
+def view_table_sample(data_loader: DataLoader, table_name: str, symbol: str, sample_size: int = 10):
     """View table data using DataLoader"""
     logger = logging.getLogger(__name__)
     try:
-        logger.info(f"Fetching sample from {table_name}...")
-        df = data_loader.get_historical_data('BTC')  # Example for historical prices
-        
+        logger.info(f"Fetching sample from {table_name} for symbol {symbol}...")
+        df = data_loader.get_historical_data(symbol)  # Use provided symbol
+
         if not df.empty:
             logger.info(f"\n=== {table_name.upper()} SAMPLE ===")
             logger.info(df.sample(min(sample_size, len(df))).to_string())
-            
+
             # Basic stats
             logger.info("\n📈 Statistics:")
             logger.info(df.describe().to_string())
-            
+
             # Visualization
             plt.figure(figsize=(10, 5))
-            df['close'].plot(title='Closing Prices Preview')
-            plt.savefig(f'{table_name}_preview.png')
+            df['close'].plot(title=f'{table_name} Closing Prices for {symbol}')
+            plt.savefig(f'{table_name}_{symbol}_preview.png')
             return True
-        return False
+        else:
+            logger.warning(f"No data found in {table_name} for symbol {symbol}.")
+            return False
     except Exception as e:
         logger.error(f"Data retrieval failed: {str(e)}")
         raise
+
+def display_top_records(data_loader: DataLoader, top_n: int = 5):
+    """Display top records from all tables in the database."""
+    logger = logging.getLogger(__name__)
+    try:
+        with data_loader._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = cursor.fetchall()
+
+            if not tables:
+                logger.warning("No tables found in the database.")
+                return
+
+            for table in tables:
+                table_name = table[0]
+                if table_name == 'sqlite_sequence': #skip internal table
+                    continue
+
+                cursor.execute(f"SELECT * FROM {table_name} LIMIT {top_n};")
+                records = cursor.fetchall()
+                columns = [description[0] for description in cursor.description]
+
+                if records:
+                    logger.info(f"\n=== Top {top_n} Records from {table_name} ===")
+                    df = pd.DataFrame(records, columns=columns)
+                    logger.info(df.to_string())
+                else:
+                    logger.warning(f"No records found in {table_name}.")
+
+    except sqlite3.Error as e:
+        logger.error(f"Database error: {e}")
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+
 
 def generate_data_visualizations(data: pd.DataFrame, table_name: str):
     """Generate visualization files"""
@@ -176,10 +214,13 @@ def main():
     parser.add_argument('--symbol', default='BTC', help='Cryptocurrency symbol')
     parser.add_argument('--output', default='results', help='Output directory')
     parser.add_argument('--init-db', action='store_true', help='Initialize database')
-    parser.add_argument('--seed-demo', action='store_true', help='Seed demo data')
+    parser.add_argument('--seed-data', action='store_true', help='Seed data')
     parser.add_argument('--view-table', help='Table name to preview')
+    parser.add_argument('--sample-size', type=int, default=10, help='sample size to view')
     parser.add_argument('--run-pipeline', action='store_true',  # Changed to store_true
                         help='Run Price Sentiment Pipeline')
+    parser.add_argument('--display-top', action='store_true', 
+                        help='Display top 5 records from all tables')
 
 
     args = parser.parse_args()
@@ -188,32 +229,38 @@ def main():
         # Load config first
         config = load_config(args.config)  # Use the function
         db_path = config["database"]["path"]
-        
+
         # Initialize components with config
         db = Database(db_path)
         data_loader = DataLoader(args.config)
-        
+
         # Example usage
         if args.init_db:
             logger.info("Initializing database schema...")
             initialize_database(args.config)
 
+        if args.seed_data:
+            logger.info("Initializing seeding prices...")
+            seed_data(args.config)
 
         # Table preview logic
         if args.view_table:
             data_loader = DataLoader(args.config)
-            view_table_sample(data_loader, args.view_table)
+            view_table_sample(data_loader, args.view_table, args.symbol, args.sample_size) #use the arguments.
 
         # Pipeline execution logic
         if args.run_pipeline:
             logger.info(f"\n{'='*30} Starting Analysis Pipeline {'='*30}")
             pipeline = PriceSentimentPipeline(args.config)
             results, forecast = pipeline.run_pipeline(args.symbol)
-            
+
             save_results(results, forecast, args.output)
             logger.info("\n=== FINAL RESULTS ===")
             logger.info(pd.Series(results).to_string())
             logger.info(f"Results saved to {args.output} directory")
+        
+        if args.display_top:
+            display_top_records(data_loader)
 
     except Exception as e:
         logger.error(f"Operation failed: {str(e)}", exc_info=True)
@@ -224,7 +271,7 @@ if __name__ == "__main__":
 
 # Initialize DB and seed data (optional standalone steps)
 # python main.py --init-db
-# python main.py --seed-demo
+# python main.py ----seed-data
 
 # # Full pipeline execution (initializes DB, seeds data, runs analysis)
 # python main.py --run-pipeline --symbol BTC --output results
